@@ -1,0 +1,182 @@
+[
+  {
+    "idx": 1,
+    "rc": 0,
+    "out_dir": "hp_runs_v2/run_001_lrft5e-05_lrh0.001_bs8_optlion_k2_wd1e-05",
+    "cfg": {
+      "lr_ft": 5e-05,
+      "lr_head": 0.001,
+      "batch_size": 8,
+      "optimizer": "lion",
+      "unfreeze_k": 2,
+      "weight_decay": 1e-05,
+      "seed": 42
+    },
+    "time_s": 185.937961
+  },
+  {
+    "idx": 2,
+    "rc": 0,
+    "out_dir": "hp_runs_v2/run_002_lrft5e-05_lrh0.001_bs8_optlion_k2_wd0.001",
+    "cfg": {
+      "lr_ft": 5e-05,
+      "lr_head": 0.001,
+      "batch_size": 8,
+      "optimizer": "lion",
+      "unfreeze_k": 2,
+      "weight_decay": 0.001,
+      "seed": 42
+    },
+    "time_s": 229.700588
+  },
+  {
+    "idx": 3,
+    "rc": 0,
+    "out_dir": "hp_runs_v2/run_003_lrft5e-05_lrh0.001_bs8_optlion_k4_wd1e-05",
+    "cfg": {
+      "lr_ft": 5e-05,
+      "lr_head": 0.001,
+      "batch_size": 8,
+      "optimizer": "lion",
+      "unfreeze_k": 4,
+      "weight_decay": 1e-05,
+      "seed": 42
+    },
+    "time_s": 689.81191
+  },
+  {
+    "idx": 4,
+    "rc": 0,
+    "out_dir": "hp_runs_v2/run_004_lrft5e-05_lrh0.001_bs8_optlion_k4_wd0.001",
+    "cfg": {
+      "lr_ft": 5e-05,
+      "lr_head": 0.001,
+      "batch_size": 8,
+      "optimizer": "lion",
+      "unfreeze_k": 4,
+      "weight_decay": 0.001,
+      "seed": 42
+    },
+    "time_s": 436.487337
+  },
+  {
+    "idx": 5,
+    "rc": 0,
+    "out_dir": "hp_runs_v2/run_005_lrft5e-05_lrh0.001_bs8_optadamw_k2_wd1e-05",
+    "cfg": {
+      "lr_ft": 5e-05,
+      "lr_head": 0.001,
+      "batch_size": 8,
+      "optimizer": "adamw",
+      "unfreeze_k": 2,
+      "weight_decay": 1e-05,
+      "seed": 42
+    },
+    "time_s": 392.19774
+  },
+  {
+    "idx": 6,
+    "rc": 0,
+    "out_dir": "hp_runs_v2/run_006_lrft5e-05_lrh0.001_bs8_optadamw_k2_wd0.001",
+    "cfg": {
+      "lr_ft": 5e-05,
+      "lr_head": 0.001,
+      "batch_size": 8,
+      "optimizer": "adamw",
+      "unfreeze_k": 2,
+      "weight_decay": 0.001,
+      "seed": 42
+    },
+    "time_s": 395.1629
+  },
+  {
+    "idx": 7,
+    "rc": 0,
+    "out_dir": "hp_runs_v2/run_007_lrft5e-05_lrh0.001_bs8_optadamw_k4_wd1e-05",
+    "cfg": {
+      "lr_ft": 5e-05,
+      "lr_head": 0.001,
+      "batch_size": 8,
+      "optimizer": "adamw",
+      "unfreeze_k": 4,
+      "weight_decay": 1e-05,
+      "seed": 42
+    },
+    "time_s": 436.446588
+  },
+  {
+    "idx": 8,
+    "rc": 0,
+    "out_dir": "hp_runs_v2/run_008_lrft5e-05_lrh0.001_bs8_optadamw_k4_wd0.001",
+    "cfg": {
+      "lr_ft": 5e-05,
+      "lr_head": 0.001,
+      "batch_size": 8,
+      "optimizer": "adamw",
+      "unfreeze_k": 4,
+      "weight_decay": 0.001,
+      "seed": 42
+    },
+    "time_s": 225.524734
+  },
+  {
+    "idx": 9,
+    "rc": 0,
+    "out_dir": "hp_runs_v2/run_009_lrft5e-05_lrh0.001_bs12_optlion_k2_wd1e-05",
+    "cfg": {
+      "lr_ft": 5e-05,
+      "lr_head": 0.001,
+      "batch_size": 12,
+      "optimizer": "lion",
+      "unfreeze_k": 2,
+      "weight_decay": 1e-05,
+      "seed": 42
+    },
+    "time_s": 121.103782
+  },
+  {
+    "idx": 10,
+    "rc": 0,
+    "out_dir": "hp_runs_v2/run_010_lrft5e-05_lrh0.001_bs12_optlion_k2_wd0.001",
+    "cfg": {
+      "lr_ft": 5e-05,
+      "lr_head": 0.001,
+      "batch_size": 12,
+      "optimizer": "lion",
+      "unfreeze_k": 2,
+      "weight_decay": 0.001,
+      "seed": 42
+    },
+    "time_s": 87.378824
+  },
+  {
+    "idx": 11,
+    "rc": 0,
+    "out_dir": "hp_runs_v2/run_011_lrft5e-05_lrh0.001_bs12_optlion_k4_wd1e-05",
+    "cfg": {
+      "lr_ft": 5e-05,
+      "lr_head": 0.001,
+      "batch_size": 12,
+      "optimizer": "lion",
+      "unfreeze_k": 4,
+      "weight_decay": 1e-05,
+      "seed": 42
+    },
+    "time_s": 93.995883
+  },
+  {
+    "idx": 12,
+    "rc": 0,
+    "out_dir": "hp_runs_v2/run_012_lrft5e-05_lrh0.001_bs12_optlion_k4_wd0.001",
+    "cfg": {
+      "lr_ft": 5e-05,
+      "lr_head": 0.001,
+      "batch_size": 12,
+      "optimizer": "lion",
+      "unfreeze_k": 4,
+      "weight_decay": 0.001,
+      "seed": 42
+    },
+    "time_s": 94.102776
+  }
+]
