@@ -1,0 +1,579 @@
+#!/usr/bin/env python3
+# smote_train.py (modified droppable version)
+"""
+SMOTE-based training script for SAND ViT baseline (memory-safe, flexible sampling).
+Writes logs and the best model to --out_dir.
+
+Example:
+python smote_train.py \
+  --data_dir /Users/pranav/Desktop/Task1 \
+  --train_xlsx /Users/pranav/Desktop/Task1/training/sand_task_1.xlsx \
+  --cache_dir /Users/pranav/Desktop/Task1/cache_logmel_N256 \
+  --train_sheet "Training Baseline - Task 1" \
+  --val_sheet "Validation Baseline - Task 1" \
+  --pretrained \
+  --epochs 30 \
+  --batch_size 8 \
+  --num_workers 0 \
+  --lr 1e-3 \
+  --weight_decay 1e-4 \
+  --optimizer adamw \
+  --device mps \
+  --out_dir ./smote_run_safe \
+  --smote_k 3 \
+  --smote_sampling_strategy not_majority \
+  --use_pca 1 \
+  --pca_dim 256 \
+  --smote_only 1,2
+"""
+from __future__ import annotations
+import argparse
+from pathlib import Path
+import sys
+import os
+import json
+import time
+import logging
+import gc
+from typing import Tuple, List, Optional, Dict
+
+import numpy as np
+import soundfile as sf
+import librosa
+from collections import Counter
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import torch.optim as optim
+from tqdm import tqdm
+
+# optional helpers / fallbacks
+try:
+    from model import build_vit
+except Exception as e:
+    raise ImportError("Could not import build_vit from model.py: " + str(e))
+try:
+    from utils import averaged_f1_from_preds, ensure_dir
+except Exception:
+    # fallback simple functions
+    def averaged_f1_from_preds(y_true, y_pred, classes):
+        from sklearn.metrics import f1_score
+        per = []
+        for c in classes:
+            y_t = [1 if y == c else 0 for y in y_true]
+            y_p = [1 if y == c else 0 for y in y_pred]
+            per.append(float(f1_score(y_t, y_p, zero_division=0)))
+        return float(np.mean(per)), per
+
+    def ensure_dir(p):
+        Path(p).mkdir(parents=True, exist_ok=True)
+
+# imblearn SMOTE
+try:
+    from imblearn.over_sampling import SMOTE
+except Exception:
+    SMOTE = None
+
+# PCA for dimensionality reduction (optional)
+try:
+    from sklearn.decomposition import PCA
+except Exception:
+    PCA = None
+
+# try torch_optimizer for Lion etc.
+try:
+    import torch_optimizer as topt
+except Exception:
+    topt = None
+
+# constants matching your dataset.py
+N_MELS = 256
+N_FFT = 1024
+HOP_LENGTH = 160
+WIN_LENGTH = None
+TOP_DB = 80.0
+
+# ---------- optimizer factory ----------
+
+
+def get_optimizer_by_name(name: str, params, lr: float, weight_decay: float):
+    n = name.lower()
+    if n in ("adamw", "adam-w"):
+        return optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    if n == "adam":
+        return optim.Adam(params, lr=lr, weight_decay=weight_decay)
+    if n == "lion":
+        if topt is not None and hasattr(topt, "Lion"):
+            return topt.Lion(params, lr=lr, weight_decay=weight_decay)
+        try:
+            import lion_pytorch
+            return lion_pytorch.Lion(params, lr=lr)
+        except Exception:
+            logging.warning(
+                "Lion optimizer not available; falling back to AdamW")
+            return optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    if n == "radam":
+        if topt is not None and hasattr(topt, "RAdam"):
+            return topt.RAdam(params, lr=lr, weight_decay=weight_decay)
+        try:
+            return optim.RAdam(params, lr=lr, weight_decay=weight_decay)
+        except Exception:
+            logging.warning("RAdam not available; falling back to AdamW")
+            return optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    logging.warning("Unknown optimizer '%s', using AdamW", name)
+    return optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+
+# ---------- utilities for loading mel stacks ----------
+
+
+def load_cached_stack(cache_dir: Path, sid: str):
+    p = cache_dir / f"{sid}.npy"
+    if not p.exists():
+        return None
+    arr = np.load(str(p))
+    return arr.astype("float32")
+
+
+def compute_stack_from_wav(wav_path: Path, sample_rate=8000, duration=5):
+    data, sr = sf.read(str(wav_path))
+    if data.ndim > 1:
+        data = data.mean(axis=1)
+    if sr != sample_rate:
+        data = librosa.resample(data.astype('float32'),
+                                orig_sr=sr, target_sr=sample_rate)
+        sr = sample_rate
+    target_len = sample_rate * duration
+    if len(data) < target_len:
+        data = np.concatenate(
+            [data, np.zeros(target_len - len(data), dtype=data.dtype)])
+    elif len(data) > target_len:
+        data = data[:target_len]
+    if data.dtype.kind == 'i':
+        info = np.iinfo(data.dtype)
+        data = data.astype('float32') / max(abs(info.min), info.max)
+    else:
+        data = data.astype('float32')
+    S = librosa.feature.melspectrogram(y=data, sr=sr, n_fft=N_FFT, hop_length=HOP_LENGTH,
+                                       win_length=WIN_LENGTH, n_mels=N_MELS, power=2.0)
+    S_db = librosa.power_to_db(S, ref=np.max, top_db=TOP_DB)
+    d1 = librosa.feature.delta(S_db, order=1)
+    d2 = librosa.feature.delta(S_db, order=2)
+    return np.stack([S_db.astype('float32'), d1.astype('float32'), d2.astype('float32')], axis=0)
+
+
+def flatten_stack(stack: np.ndarray) -> np.ndarray:
+    return stack.ravel()
+
+
+def unflatten_stack(flat: np.ndarray, shape: Tuple[int, int, int]):
+    return flat.reshape(shape)
+
+# dataset wrapper for SMOTE-produced stacks (small utility)
+
+
+class SmoteStackDataset(Dataset):
+    def __init__(self, stacks: np.ndarray, labels: np.ndarray):
+        self.stacks = stacks.astype('float32')
+        self.labels = labels.astype(int)
+        import torchvision.transforms as T
+        self.to_tensor = T.Compose(
+            [T.ToPILImage(), T.Resize((224, 224)), T.ToTensor()])
+
+    def __len__(self):
+        return len(self.stacks)
+
+    def __getitem__(self, idx):
+        stack = self.stacks[idx]
+        chans, H, W = stack.shape
+        stack_norm = np.zeros_like(stack, dtype=np.uint8)
+        for c in range(chans):
+            s = stack[c]
+            m = s.mean()
+            sd = s.std() if s.std() > 0 else 1.0
+            sn = (s - m) / sd
+            smin, smax = sn.min(), sn.max()
+            if smax - smin > 0:
+                ssc = (sn - smin) / (smax - smin)
+            else:
+                ssc = sn - smin
+            stack_norm[c] = (ssc * 255.0).astype('uint8')
+        img = np.transpose(stack_norm, (1, 2, 0)).astype('uint8')
+        tensor = self.to_tensor(img)
+        return tensor.to(torch.float32), int(self.labels[idx])
+
+# ---------- CLI ----------
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--data_dir", required=True)
+    p.add_argument("--train_xlsx", required=True)
+    p.add_argument("--cache_dir", default=None)
+    p.add_argument("--train_sheet", default="Training Baseline - Task 1")
+    p.add_argument("--val_sheet", default="Validation Baseline - Task 1")
+    p.add_argument("--pretrained", action="store_true")
+    p.add_argument("--epochs", type=int, default=30)
+    p.add_argument("--batch_size", type=int, default=8)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--optimizer", type=str, default="adamw",
+                   choices=["adamw", "lion", "radam", "adam"])
+    p.add_argument("--device", type=str, default="cpu")
+    p.add_argument("--out_dir", type=str, default="./smote_out")
+    p.add_argument("--seed", type=int, default=42)
+
+    p.add_argument("--smote_k", type=int, default=5,
+                   help="k_neighbors for SMOTE")
+    p.add_argument("--smote_sampling_strategy", type=str, default="not_majority",
+                   help="SMOTE sampling_strategy string: 'auto', 'not_majority', 'minority' or 'all' (alias), or 'dict' by passing --smote_only to build a dict")
+    p.add_argument("--smote_only", type=str, default="",
+                   help="Comma-separated class ids to only oversample (e.g. '1,2') -> these will be raised to majority count")
+    p.add_argument("--use_pca", type=int, default=1,
+                   help="If 1, run PCA reduction before SMOTE (memory saver). Requires sklearn.")
+    p.add_argument("--pca_dim", type=int, default=256,
+                   help="PCA dimension (if use_pca=1)")
+
+    p.add_argument("--num_workers", type=int, default=0,
+                   help="num_workers for DataLoader (0 recommended on macOS/MPS)")
+    p.add_argument("--pin_memory", action="store_true",
+                   help="pin_memory for DataLoader (avoid on MPS; default False)")
+    p.add_argument("--verbose", action="store_true")
+    return p.parse_args()
+
+# ---------- small helpers ----------
+
+
+def parse_smote_only(s: str):
+    if not s:
+        return []
+    parts = [x.strip() for x in s.split(",") if x.strip()]
+    return [int(x) for x in parts]
+
+
+def make_sampling_strategy_from_counts(counts: Dict[int, int], smote_only: List[int]):
+    """
+    If smote_only provided, return dict mapping that class -> target_count (majority count).
+    Otherwise return None so SMOTE uses provided string strategy (auto/not_majority/etc).
+    """
+    if not smote_only:
+        return None
+    max_n = max(counts.values())
+    # target: raise each listed class to majority (max_n)
+    d = {}
+    for cls in smote_only:
+        if cls in counts:
+            d[int(cls)] = int(max_n)
+    return d
+
+
+def mem_report(prefix=""):
+    try:
+        import psutil
+        p = psutil.Process()
+        rss = p.memory_info().rss / (1024**3)
+        logging.info(f"{prefix} RSS_GB={rss:.2f}")
+    except Exception:
+        pass
+
+# ---------- main ----------
+
+
+def main():
+    args = parse_args()
+    ensure_dir(args.out_dir)
+    logging.basicConfig(level=logging.INFO if args.verbose else logging.INFO,
+                        format='%(asctime)s %(levelname)s: %(message)s')
+    logging.info("SMOTE training script (modified safe version)")
+    cfg = vars(args).copy()
+    logging.info(json.dumps({k: str(v) for k, v in cfg.items()}, indent=2))
+
+    # read sheets
+    import pandas as pd
+    train_df = pd.read_excel(args.train_xlsx, sheet_name=args.train_sheet)
+    val_df = pd.read_excel(args.train_xlsx, sheet_name=args.val_sheet)
+    if 'ID' not in train_df.columns:
+        raise RuntimeError("train sheet missing ID")
+    if 'Class' not in train_df.columns:
+        raise RuntimeError("train sheet missing Class")
+    train_ids = train_df['ID'].astype(str).tolist()
+    train_labels = train_df['Class'].fillna(-1).astype(int).tolist()
+    val_ids = val_df['ID'].astype(str).tolist()
+    val_labels = val_df['Class'].fillna(-1).astype(int).tolist()
+
+    cache_dir = Path(args.cache_dir) if args.cache_dir else None
+    data_root = Path(args.data_dir) / 'training'
+
+    # load training stacks
+    stacks = []
+    labels = []
+    missing = []
+    shape0 = None
+    logging.info("Loading training stacks (cached or compute)...")
+    for sid, lbl in tqdm(zip(train_ids, train_labels), total=len(train_ids)):
+        st = None
+        if cache_dir:
+            st = load_cached_stack(
+                cache_dir / args.train_sheet.replace(' ', '_'), sid)
+        if st is None:
+            wav_path = None
+            priority = ['phonationA', 'phonationE', 'phonationI',
+                        'phonationO', 'phonationU', 'rhythmKA', 'rhythmPA', 'rhythmTA']
+            for folder in priority:
+                cand = data_root / folder / f"{sid}_{folder}.wav"
+                if cand.exists():
+                    wav_path = cand
+                    break
+                cand2 = data_root / folder / f"{sid}_{folder.lower()}.wav"
+                if cand2.exists():
+                    wav_path = cand2
+                    break
+            if wav_path is None:
+                for folder in data_root.iterdir():
+                    if not folder.is_dir():
+                        continue
+                    for f in folder.iterdir():
+                        if f.is_file() and f.name.startswith(f"{sid}_") and f.suffix.lower() == '.wav':
+                            wav_path = f
+                            break
+                    if wav_path:
+                        break
+            if wav_path is None:
+                missing.append(sid)
+                continue
+            st = compute_stack_from_wav(wav_path)
+        stacks.append(st)
+        labels.append(int(lbl))
+        if shape0 is None:
+            shape0 = st.shape
+
+    if len(stacks) == 0:
+        raise RuntimeError("No training stacks found!")
+
+    stacks = np.stack(stacks, axis=0)  # (N, C, H, W)
+    labels = np.array(labels, dtype=int)
+    logging.info("Train label counts: %s", dict(Counter(labels)))
+    mem_report("after loading stacks")
+
+    # Flatten for SMOTE / or compute reduced features via PCA
+    N, C, H, W = stacks.shape
+    X = stacks.reshape((N, C * H * W)).astype('float32')
+    y = labels.copy()
+
+    # build sampling_strategy if smote_only is passed
+    smote_only = parse_smote_only(args.smote_only)
+    sampling_strategy_dict = make_sampling_strategy_from_counts(
+        dict(Counter(y)), smote_only)
+    if sampling_strategy_dict is not None:
+        logging.info(
+            "Using sampling_strategy dict (only oversampling classes): %s", sampling_strategy_dict)
+        smote_strategy_for_smote = sampling_strategy_dict
+    else:
+        # pass the user string; map 'all' -> 'auto'
+        s = args.smote_sampling_strategy
+        if s in ("all", "auto"):
+            smote_strategy_for_smote = "auto"
+        elif s in ("not_majority", "not-majority", "not majority"):
+            smote_strategy_for_smote = "not majority"
+        elif s in ("minority",):
+            smote_strategy_for_smote = "minority"
+        else:
+            smote_strategy_for_smote = s
+
+    # (optional) PCA reduction before SMOTE to reduce memory used by SMOTE's internals
+    use_pca = bool(int(args.use_pca)) and (PCA is not None)
+    if use_pca:
+        pca_dim = int(min(args.pca_dim, max(2, N-1)))
+        logging.info(
+            "Running PCA -> dim=%d before SMOTE (memory saver).", pca_dim)
+        p = PCA(n_components=pca_dim)
+        X_red = p.fit_transform(X)
+        mem_report("after PCA transform (X_red)")
+    else:
+        X_red = X  # SMOTE will operate on full flattened vectors
+
+    # ensure SMOTE available
+    if SMOTE is None:
+        raise RuntimeError(
+            "imblearn not installed. pip install imbalanced-learn")
+
+    # run SMOTE (on reduced X_red if PCA used)
+    logging.info("Running SMOTE k=%d sampling_strategy=%s ...",
+                 args.smote_k, str(smote_strategy_for_smote))
+    sm = SMOTE(k_neighbors=int(args.smote_k),
+               sampling_strategy=smote_strategy_for_smote, random_state=int(args.seed))
+    Xr_red, yr = sm.fit_resample(X_red, y)
+    logging.info("After SMOTE raw label counts: %s", dict(Counter(yr)))
+    mem_report("after SMOTE fit_resample")
+
+    # convert back to original flattened space if PCA used (inverse_transform)
+    if use_pca:
+        logging.info(
+            "Inverse transforming PCA-ed features back to original dimension (may allocate memory)...")
+        Xr = p.inverse_transform(Xr_red).astype('float32')
+    else:
+        Xr = Xr_red.astype('float32')
+
+    # report percentages before/after
+    before_counts = dict(Counter(y))
+    after_counts = dict(Counter(yr))
+    total_before = float(len(y))
+    total_after = float(len(yr))
+    before_pct = {k: v / total_before *
+                  100.0 for k, v in before_counts.items()}
+    after_pct = {k: v / total_after * 100.0 for k, v in after_counts.items()}
+    logging.info("Before counts: %s", before_counts)
+    logging.info("After counts: %s", after_counts)
+    logging.info("Before pct: %s", {
+                 k: f"{v:.2f}%" for k, v in before_pct.items()})
+    logging.info("After pct: %s", {
+                 k: f"{v:.2f}%" for k, v in after_pct.items()})
+
+    # free original arrays
+    try:
+        del X, X_red, Xr_red, y
+    except Exception:
+        pass
+    gc.collect()
+    mem_report("after freeing originals")
+
+    # unflatten back to stacks
+    stacks_res = Xr.reshape((-1, C, H, W)).astype('float32')
+    labels_res = yr.astype(int)
+    logging.info("Prepared SMOTE-res stacks shape: %s", stacks_res.shape)
+    mem_report("after unflatten stacks_res")
+
+    # build train dataset and validation dataset (validation unchanged)
+    train_dataset = SmoteStackDataset(stacks_res, labels_res)
+
+    # load validation stacks (no SMOTE)
+    logging.info("Loading validation stacks...")
+    val_stacks = []
+    val_lbls = []
+    for sid, lbl in tqdm(zip(val_ids, val_labels), total=len(val_ids)):
+        st = None
+        if cache_dir:
+            st = load_cached_stack(
+                cache_dir / args.val_sheet.replace(' ', '_'), sid) if cache_dir else None
+        if st is None:
+            wav_path = None
+            priority = ['phonationA', 'phonationE', 'phonationI',
+                        'phonationO', 'phonationU', 'rhythmKA', 'rhythmPA', 'rhythmTA']
+            for folder in priority:
+                cand = data_root / folder / f"{sid}_{folder}.wav"
+                if cand.exists():
+                    wav_path = cand
+                    break
+                cand2 = data_root / folder / f"{sid}_{folder.lower()}.wav"
+                if cand2.exists():
+                    wav_path = cand2
+                    break
+            if wav_path is None:
+                for folder in data_root.iterdir():
+                    if not folder.is_dir():
+                        continue
+                    for f in folder.iterdir():
+                        if f.is_file() and f.name.startswith(f"{sid}_") and f.suffix.lower() == '.wav':
+                            wav_path = f
+                            break
+                    if wav_path:
+                        break
+            if wav_path is None:
+                continue
+            st = compute_stack_from_wav(wav_path)
+        val_stacks.append(st)
+        val_lbls.append(int(lbl))
+    if len(val_stacks) == 0:
+        raise RuntimeError("No validation stacks found!")
+    val_stacks = np.stack(val_stacks, axis=0)
+    val_lbls = np.array(val_lbls, dtype=int)
+    val_dataset = SmoteStackDataset(val_stacks, val_lbls)
+
+    # dataloaders (safe defaults)
+    train_loader = DataLoader(train_dataset, batch_size=int(args.batch_size),
+                              shuffle=True, num_workers=int(args.num_workers),
+                              pin_memory=bool(args.pin_memory), persistent_workers=False)
+    val_loader = DataLoader(val_dataset, batch_size=int(args.batch_size),
+                            shuffle=False, num_workers=min(2, int(args.num_workers)),
+                            pin_memory=False, persistent_workers=False)
+
+    # build model
+    device = torch.device(args.device)
+    model = build_vit(
+        num_classes=5, pretrained=args.pretrained, device=args.device)
+    model.to(device)
+    logging.info("Model params total=%d trainable=%d", sum(p.numel() for p in model.parameters()),
+                 sum(p.numel() for p in model.parameters() if p.requires_grad))
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = get_optimizer_by_name(args.optimizer, [p for p in model.parameters() if p.requires_grad],
+                                      lr=float(args.lr), weight_decay=float(args.weight_decay))
+
+    best_f1 = -1.0
+    best_path = None
+
+    for epoch in range(1, int(args.epochs) + 1):
+        t0 = time.time()
+        model.train()
+        running_loss = 0.0
+        n = 0
+        for xb, yb in tqdm(train_loader, desc=f"train epoch {epoch}", leave=False):
+            xb = xb.to(device)
+            yb = yb.to(device).long()
+            optimizer.zero_grad()
+            logits = model(xb)
+            loss = criterion(logits, yb - 1)  # labels 1..5 -> 0..4
+            loss.backward()
+            optimizer.step()
+            bs = xb.size(0)
+            running_loss += loss.item() * bs
+            n += bs
+        train_loss = running_loss / (n if n else 1.0)
+
+        # validation
+        model.eval()
+        y_true = []
+        y_pred = []
+        with torch.no_grad():
+            for xb, yb in tqdm(val_loader, desc="val", leave=False):
+                xb = xb.to(device)
+                logits = model(xb)
+                preds = torch.argmax(logits, dim=1).cpu().numpy() + 1
+                y_pred.extend(preds.tolist())
+                y_true.extend(yb.numpy().tolist())
+        avg_f1, per_class = averaged_f1_from_preds(
+            y_true, y_pred, classes=[1, 2, 3, 4, 5])
+        per_class_str = ";".join([f"{x:.4f}" for x in per_class])
+        t = time.time() - t0
+        logging.info(
+            f"Epoch {epoch}/{args.epochs} | train_loss={train_loss:.4f} | val_f1={avg_f1:.4f} | per_class=[{per_class_str}] | time={t:.1f}s")
+
+        # save best
+        if avg_f1 > best_f1:
+            best_f1 = avg_f1
+            best_path = Path(args.out_dir) / "best_model.pt"
+            torch.save(
+                {'epoch': epoch, 'model_state': model.state_dict()}, best_path)
+            logging.info("Saved new best model: %s", best_path)
+
+        # epoch cleanup
+        try:
+            del xb, yb, logits, preds
+        except Exception:
+            pass
+        gc.collect()
+        try:
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+            else:
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        mem_report(f"after epoch {epoch}")
+
+    logging.info("Training finished. best_f1=%f best_model=%s",
+                 best_f1, str(best_path))
+    print(f"Averaged validation F1 (best): {best_f1:.6f}")
+
+
+if __name__ == "__main__":
+    main()

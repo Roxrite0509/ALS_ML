@@ -1,0 +1,424 @@
+# dataset.py
+from pathlib import Path
+import soundfile as sf
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+from torchvision import transforms
+from PIL import Image
+import pandas as pd
+import librosa
+import random
+from collections import Counter
+from typing import Optional, Tuple, Any
+
+# ----------------------------
+# Config / constants (tweak if needed)
+# ----------------------------
+DEFAULT_SAMPLE_RATE = 8000
+DEFAULT_DURATION_SEC = 5
+TARGET_LENGTH = DEFAULT_SAMPLE_RATE * DEFAULT_DURATION_SEC
+
+N_MELS = 256
+N_FFT = 1024
+HOP_LENGTH = 160
+WIN_LENGTH = None
+TOP_DB = 80.0
+
+OUT_SIZE = (224, 224)
+
+resize = transforms.Compose([
+    transforms.Resize(OUT_SIZE),
+    transforms.ToTensor()
+])
+
+# ----------------------------
+# Augmentation / helpers
+# ----------------------------
+
+
+def add_noise(wav: np.ndarray, noise_level_db: float = -30.0) -> np.ndarray:
+    """Add Gaussian noise scaled by noise_level_db relative to signal RMS."""
+    wav = wav.astype('float32')
+    rms = np.sqrt(np.mean(wav**2)) + 1e-9
+    noise_rms = rms * (10 ** (noise_level_db / 20.0))
+    noise = np.random.normal(0, noise_rms, size=wav.shape).astype('float32')
+    return wav + noise
+
+
+def random_time_stretch(wav: np.ndarray, low: float = 0.9, high: float = 1.1) -> np.ndarray:
+    """Time-stretch with fallbacks. Returns a waveform possibly different length."""
+    rate = float(np.random.uniform(low, high))
+    try:
+        stretched = librosa.effects.time_stretch(wav.astype('float32'), rate)
+        return stretched
+    except Exception:
+        # fallback: resample approximation
+        try:
+            target_len = int(len(wav) / max(1e-6, rate))
+            resampled = librosa.resample(wav.astype(
+                'float32'), orig_sr=DEFAULT_SAMPLE_RATE, target_sr=DEFAULT_SAMPLE_RATE)
+            return resampled[:target_len]
+        except Exception:
+            return wav
+
+
+def random_pitch_shift(wav: np.ndarray, sr: int, n_steps_low: float = -2.0, n_steps_high: float = 2.0) -> np.ndarray:
+    """Pitch shift in semitones with safe fallback."""
+    n_steps = float(np.random.uniform(n_steps_low, n_steps_high))
+    try:
+        return librosa.effects.pitch_shift(wav.astype('float32'), sr=sr, n_steps=n_steps)
+    except Exception:
+        return wav
+
+
+def random_augment(wav: np.ndarray, sr: int, strong: bool = False) -> np.ndarray:
+    """
+    Waveform-level augmentations.
+    - strong=True uses more aggressive augment magnitudes (for very rare classes).
+    """
+    out = wav.astype('float32')
+
+    # additive noise (more likely & stronger for 'strong')
+    if np.random.rand() < (0.9 if strong else 0.7):
+        level = np.random.uniform(-45, -
+                                  10) if strong else np.random.uniform(-35, -20)
+        out = add_noise(out, noise_level_db=level)
+
+    # time stretch
+    if np.random.rand() < (0.7 if strong else 0.5):
+        low, high = (0.8, 1.2) if strong else (0.92, 1.08)
+        out = random_time_stretch(out, low=low, high=high)
+
+    # pitch shift
+    if np.random.rand() < (0.6 if strong else 0.45):
+        n_low, n_high = (-4, 4) if strong else (-2, 2)
+        out = random_pitch_shift(
+            out, sr, n_steps_low=n_low, n_steps_high=n_high)
+
+    # random time roll (cyclic shift)
+    if np.random.rand() < (0.5 if strong else 0.3):
+        max_shift_sec = 0.25 if strong else 0.1
+        shift = int(random.uniform(-max_shift_sec, max_shift_sec) * sr)
+        if shift != 0:
+            out = np.roll(out, shift)
+
+    # ensure length after augmentations
+    if len(out) < TARGET_LENGTH:
+        out = np.concatenate(
+            [out, np.zeros(TARGET_LENGTH - len(out), dtype=out.dtype)])
+    elif len(out) > TARGET_LENGTH:
+        out = out[:TARGET_LENGTH]
+
+    return out.astype('float32')
+
+
+def spec_augment(S: np.ndarray, num_masks: int = 2, freq_mask_param: int = 20, time_mask_param: int = 40) -> np.ndarray:
+    """
+    Simple SpecAugment implementation over a mel spectrogram (n_mels, T).
+    Zeroes out rectangular frequency/time bands.
+    """
+    S_aug = S.copy()
+    n_mels, t = S_aug.shape
+    # frequency masks
+    for _ in range(num_masks):
+        f = np.random.randint(0, min(freq_mask_param, n_mels) + 1)
+        if f <= 0:
+            continue
+        f0 = np.random.randint(0, max(1, n_mels - f))
+        S_aug[f0:f0+f, :] = 0.0
+    # time masks
+    for _ in range(num_masks):
+        tt = np.random.randint(0, min(time_mask_param, t) + 1)
+        if tt <= 0:
+            continue
+        t0 = np.random.randint(0, max(1, t - tt))
+        S_aug[:, t0:t0+tt] = 0.0
+    return S_aug
+
+
+# ----------------------------
+# WAV finding helper
+# ----------------------------
+DEFAULT_PRIORITY = [
+    'phonationA', 'phonationE', 'phonationI', 'phonationO', 'phonationU',
+    'rhythmKA', 'rhythmPA', 'rhythmTA'
+]
+
+
+def find_wav_for_subject(root: Path, sid: str, recording_priority=DEFAULT_PRIORITY) -> Optional[Path]:
+    """
+    Try preferred filenames first, then fallback to searching subfolders for files starting with sid_.
+    """
+    root = Path(root)
+    for folder in recording_priority:
+        candidate = root / folder / f"{sid}_{folder}.wav"
+        if candidate.exists():
+            return candidate
+        candidate2 = root / folder / f"{sid}_{folder.lower()}.wav"
+        if candidate2.exists():
+            return candidate2
+    # fallback search
+    for folder in root.iterdir():
+        if not folder.is_dir():
+            continue
+        for f in folder.iterdir():
+            if f.is_file() and f.name.startswith(f"{sid}_") and f.suffix.lower() == '.wav':
+                return f
+    return None
+
+# ----------------------------
+# Dataset class
+# ----------------------------
+
+
+class SandSubjectDataset(Dataset):
+    """
+    Dataset of SAND subject-level wavs -> computed mel+deltas stacks (3, n_mels, T)
+
+    New features:
+      - embedding_mode (bool) if True loads precomputed embeddings from embedding_cache and returns (embedding_tensor, label, sid)
+      - embedding_cache should contain either (embeddings.npy, labels.npy, sids.npy) OR (emb_smote.npy, labels_smote.npy)
+
+    Original behavior (mel stacks, caching, waveform augment) is preserved when embedding_mode is False.
+    """
+
+    def __init__(self, root_dir: str, xlsx_path: str, sheet_name: str,
+                 cache_dir: str = None, recording_priority=None,
+                 sample_rate: int = DEFAULT_SAMPLE_RATE, duration: int = DEFAULT_DURATION_SEC,
+                 train_mode: bool = False, embedding_mode: bool = False, embedding_cache: Optional[str] = None):
+        self.root = Path(root_dir)
+        self.xlsx_path = Path(xlsx_path)
+        self.sheet_name = sheet_name
+        self.sample_rate = int(sample_rate)
+        self.duration = int(duration)
+        self.target_length = int(self.sample_rate * self.duration)
+        self.cache_dir = Path(cache_dir) if cache_dir else None
+        self.recording_priority = recording_priority or DEFAULT_PRIORITY
+
+        # read sheet
+        df = pd.read_excel(self.xlsx_path, sheet_name=self.sheet_name)
+        if 'ID' not in df.columns:
+            raise ValueError("Excel sheet must contain 'ID' column")
+        self.df = df
+        self.ids = df['ID'].astype(str).tolist()
+        self.labels = None
+        if 'Class' in df.columns:
+            # fillna with -1 (unknown), convert to int where possible
+            self.labels = df['Class'].fillna(-1).astype(int).tolist()
+        self.train_mode = bool(train_mode)
+        self.embedding_mode = bool(embedding_mode)
+
+        # compute class frequencies for augment decisions
+        if self.labels is not None:
+            cnt = Counter(self.labels)
+            # ensure int keys
+            self.class_freq = {int(k): int(v) for k, v in cnt.items()}
+        else:
+            self.class_freq = {}
+
+        # setup cache subdir per sheet (if provided)
+        if self.cache_dir:
+            self.cache_subdir = self.cache_dir / \
+                self.sheet_name.replace(' ', '_')
+        else:
+            self.cache_subdir = None
+
+        # Embedding cache support (optional)
+        self.embedding_cache = Path(
+            embedding_cache) if embedding_cache else None
+        self._use_embedding_cache = self.embedding_mode and (
+            self.embedding_cache is not None)
+        self._embeddings = None
+        self._labels_emb = None
+        self._sids_emb = None
+        if self._use_embedding_cache:
+            # prefer original names first, else SMOTE outputs
+            emb_path = self.embedding_cache / "embeddings.npy"
+            if not emb_path.exists():
+                emb_path = self.embedding_cache / "emb_smote.npy"
+            if not emb_path.exists():
+                raise FileNotFoundError(
+                    f"Embedding cache requested but no embeddings file found in {self.embedding_cache}")
+            # load embeddings
+            self._embeddings = np.load(str(emb_path))
+            # load labels (original or smote)
+            labs_path = self.embedding_cache / "labels.npy"
+            if not labs_path.exists():
+                labs_path = self.embedding_cache / "labels_smote.npy"
+            if labs_path.exists():
+                self._labels_emb = np.load(str(labs_path)).astype(int)
+            else:
+                # if labels not present, try deriving from sheet (best-effort)
+                # NOTE: in SMOTE case labels_smote should exist; otherwise we require labels.npy
+                raise FileNotFoundError(
+                    f"Embedding cache found but label file missing (labels.npy or labels_smote.npy) in {self.embedding_cache}")
+            # optional sids mapping (used for traceability); if missing we create synthetic sids
+            sids_path = self.embedding_cache / "sids.npy"
+            if sids_path.exists():
+                self._sids_emb = np.load(str(sids_path)).astype(str)
+            else:
+                # create synthetic sids for embeddings if not provided
+                self._sids_emb = np.array(
+                    [f"emb_{i}" for i in range(len(self._labels_emb))], dtype=str)
+
+    def __len__(self) -> int:
+        if self.embedding_mode and self._use_embedding_cache and (self._labels_emb is not None):
+            return len(self._labels_emb)
+        return len(self.ids)
+
+    def _load_cached_stack(self, sid: str) -> Optional[np.ndarray]:
+        """Return np.ndarray (float32) shape (3, n_mels, T) when cache exists, else None."""
+        if self.cache_subdir is None:
+            return None
+        p = self.cache_subdir / f"{sid}.npy"
+        if not p.exists():
+            return None
+        try:
+            arr = np.load(str(p))
+            # ensure float32
+            if arr.dtype != np.float32:
+                arr = arr.astype('float32')
+            return arr
+        except Exception:
+            return None
+
+    def _load_wav(self, wav_path: Path) -> Tuple[np.ndarray, int]:
+        """Load wav, resample to dataset sample_rate, pad/trim to target_length, return (np.ndarray, sr)."""
+        data, sr = sf.read(str(wav_path))
+        if data.ndim > 1:
+            data = data.mean(axis=1)
+        if sr != self.sample_rate:
+            data = librosa.resample(data.astype(
+                'float32'), orig_sr=sr, target_sr=self.sample_rate)
+            sr = self.sample_rate
+        if len(data) < self.target_length:
+            pad_len = self.target_length - len(data)
+            data = np.concatenate([data, np.zeros(pad_len, dtype=data.dtype)])
+        elif len(data) > self.target_length:
+            data = data[:self.target_length]
+        # normalize integer waveforms to [-1,1]
+        if data.dtype.kind == 'i':
+            info = np.iinfo(data.dtype)
+            data = data.astype('float32') / max(abs(info.min), info.max)
+        else:
+            data = data.astype('float32')
+        return data, sr
+
+    def _wave_to_mel_and_deltas(self, waveform: np.ndarray, sr: int) -> np.ndarray:
+        """
+        Compute log-mel spectrogram + delta1 + delta2.
+        Returns stack shape (3, n_mels, T) dtype float32.
+        """
+        S = librosa.feature.melspectrogram(
+            y=waveform, sr=sr, n_fft=N_FFT, hop_length=HOP_LENGTH,
+            win_length=WIN_LENGTH, n_mels=N_MELS, power=2.0
+        )
+        S_db = librosa.power_to_db(S, ref=np.max, top_db=TOP_DB)
+        d1 = librosa.feature.delta(S_db, order=1)
+        d2 = librosa.feature.delta(S_db, order=2)
+        return np.stack([S_db.astype('float32'), d1.astype('float32'), d2.astype('float32')], axis=0)
+
+    def _stack_to_tensor(self, stack: np.ndarray) -> torch.Tensor:
+        """
+        Convert (3, H, W) float stack -> resized torch tensor (C,H',W') normalized [0,1].
+        We normalize per-channel and convert to uint8 -> PIL to apply torchvision.Resize + ToTensor.
+        """
+        chans, H, W = stack.shape
+        # normalize per-channel to [0,255] uint8
+        stack_norm = np.zeros_like(stack, dtype=np.uint8)
+        for c in range(chans):
+            s = stack[c]
+            m = s.mean()
+            sd = s.std() if s.std() > 0 else 1.0
+            sn = (s - m) / sd
+            smin, smax = sn.min(), sn.max()
+            if smax - smin > 0:
+                ssc = (sn - smin) / (smax - smin)
+            else:
+                ssc = sn - smin
+            stack_norm[c] = (ssc * 255.0).astype('uint8')
+        img = np.transpose(stack_norm, (1, 2, 0)).astype('uint8')
+        pil = Image.fromarray(img)
+        tensor = resize(pil)  # returns float tensor in [0,1]
+        return tensor
+
+    def __getitem__(self, idx: int) -> Tuple[Any, int, str]:
+        """
+        Returns:
+            if embedding_mode and embedding_cache used:
+                embedding_tensor (torch.float32, shape (D,)), label (int), sid (str)
+            else:
+                tensor (torch.float32): image-like tensor (3, H', W'), label (int), sid (str)
+
+        Behavior:
+            - Embedding-mode: returns precomputed embedding and label (uses embedding_cache).
+            - Non-embedding mode: uses cached .npy stack when available (applies SpecAugment randomly).
+              Otherwise loads wav, optionally applies waveform augmentations (stronger for rare classes),
+              computes mel+delta stack, optionally applies SpecAugment, returns tensor.
+        """
+        # Embedding-mode path
+        if self.embedding_mode and self._use_embedding_cache and (self._labels_emb is not None):
+            emb = self._embeddings[idx]
+            label = int(self._labels_emb[idx])
+            sid = str(self._sids_emb[idx]) if (
+                self._sids_emb is not None) else f"emb_{idx}"
+            return torch.from_numpy(emb).float(), label, sid
+
+        # Standard mel-based path
+        sid = self.ids[idx]
+        label = int(self.labels[idx]) if self.labels is not None else -1
+
+        # use precomputed cache if available
+        cached = self._load_cached_stack(sid)
+        if cached is not None:
+            stack = cached.copy()
+            if self.train_mode and np.random.rand() < 0.9:
+                mel = stack[0]
+                mel = spec_augment(
+                    mel, num_masks=2, freq_mask_param=20, time_mask_param=40)
+                d1 = librosa.feature.delta(mel, order=1)
+                d2 = librosa.feature.delta(mel, order=2)
+                stack = np.stack([mel.astype('float32'), d1.astype(
+                    'float32'), d2.astype('float32')], axis=0)
+            tensor = self._stack_to_tensor(stack)
+            return tensor.to(torch.float32), label, sid
+
+        # else process wav on the fly
+        wav_path = find_wav_for_subject(
+            self.root, sid, recording_priority=self.recording_priority)
+        if wav_path is None:
+            raise FileNotFoundError(
+                f"Could not find WAV for subject {sid} under {self.root}")
+
+        waveform, sr = self._load_wav(wav_path)
+
+        # training-time waveform augment (more aggressive for very rare classes)
+        if self.train_mode:
+            freq = self.class_freq.get(label, 1)
+            if freq <= 5:
+                p_aug = min(0.99, 0.4 + (2.0 / (freq + 1.0)))
+                strong = True
+            else:
+                p_aug = min(0.9, 0.1 + (1.0 / (freq + 1.0)))
+                strong = False
+            if np.random.rand() < p_aug:
+                waveform = random_augment(waveform, sr, strong=strong)
+
+        # compute mel + deltas
+        stack = self._wave_to_mel_and_deltas(waveform, sr)
+
+        # apply spec augment with slightly higher prob for very rare classes
+        if self.train_mode:
+            prob_spec = 0.9 if (self.class_freq.get(label, 1) <= 5) else 0.8
+            if np.random.rand() < prob_spec:
+                mel = stack[0]
+                mel = spec_augment(
+                    mel, num_masks=2, freq_mask_param=20, time_mask_param=40)
+                d1 = librosa.feature.delta(mel, order=1)
+                d2 = librosa.feature.delta(mel, order=2)
+                stack = np.stack([mel.astype('float32'), d1.astype(
+                    'float32'), d2.astype('float32')], axis=0)
+
+        tensor = self._stack_to_tensor(stack)
+        return tensor.to(torch.float32), label, sid

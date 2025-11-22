@@ -1,0 +1,298 @@
+# model.py (drop-in replacement)
+from typing import Optional, Tuple
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+try:
+    from torchvision.models import vit_b_16, ViT_B_16_Weights
+except Exception:
+    vit_b_16 = None
+    ViT_B_16_Weights = None
+
+
+# --------------------------
+# Helpers to inspect model
+# --------------------------
+def _find_transformer_blocks(model):
+    candidates = []
+    if hasattr(model, "encoder"):
+        enc = getattr(model, "encoder")
+        if hasattr(enc, "layers"):
+            candidates.append((enc, enc.layers))
+        if hasattr(enc, "blocks"):
+            candidates.append((enc, enc.blocks))
+        if hasattr(enc, "encoder"):
+            enc2 = getattr(enc, "encoder")
+            if hasattr(enc2, "layers"):
+                candidates.append((enc2, enc2.layers))
+            if hasattr(enc2, "blocks"):
+                candidates.append((enc2, enc2.blocks))
+    if hasattr(model, "transformer"):
+        tr = getattr(model, "transformer")
+        if hasattr(tr, "encoder"):
+            enc = getattr(tr, "encoder")
+            if hasattr(enc, "layers"):
+                candidates.append((enc, enc.layers))
+            if hasattr(enc, "blocks"):
+                candidates.append((enc, enc.blocks))
+    if len(candidates) == 0:
+        return None, None
+    return candidates[0]
+
+
+def _get_head_in_features(head_module: nn.Module) -> Optional[int]:
+    if isinstance(head_module, nn.Linear):
+        return head_module.in_features
+    if hasattr(head_module, "in_features"):
+        try:
+            return int(getattr(head_module, "in_features"))
+        except Exception:
+            pass
+    for c in reversed(list(head_module.children())):
+        if isinstance(c, nn.Linear):
+            return c.in_features
+        for sc in reversed(list(c.children())):
+            if isinstance(sc, nn.Linear):
+                return sc.in_features
+    return None
+
+
+def _replace_head_with_linear_module(model: nn.Module, num_classes: int, head_dropout: float = 0.0):
+    """
+    Replace the classifier head in-place for torchvision ViT variants.
+    """
+    if hasattr(model, "heads"):
+        head = model.heads
+        in_features = _get_head_in_features(head)
+        if in_features is None:
+            if hasattr(model, "classifier") and hasattr(model.classifier, "in_features"):
+                in_features = model.classifier.in_features
+        if in_features is None:
+            raise RuntimeError(
+                "Cannot determine classifier in_features for ViT model.")
+        if head_dropout is not None and head_dropout > 0.0:
+            new_head = nn.Sequential(nn.Dropout(
+                head_dropout), nn.Linear(in_features, num_classes))
+        else:
+            new_head = nn.Linear(in_features, num_classes)
+        model.heads = new_head
+        return model
+    if hasattr(model, "classifier"):
+        clf = model.classifier
+        in_features = getattr(clf, "in_features", None)
+        if in_features is not None:
+            if head_dropout is not None and head_dropout > 0.0:
+                new_head = nn.Sequential(nn.Dropout(
+                    head_dropout), nn.Linear(in_features, num_classes))
+            else:
+                new_head = nn.Linear(in_features, num_classes)
+            model.classifier = new_head
+            return model
+    # fallback
+    default_feat = 768
+    if head_dropout is not None and head_dropout > 0.0:
+        model.heads = nn.Sequential(nn.Dropout(
+            head_dropout), nn.Linear(default_feat, num_classes))
+    else:
+        model.heads = nn.Linear(default_feat, num_classes)
+    return model
+
+
+def freeze_backbone(model: nn.Module, freeze: bool = True, exclude_head: bool = True) -> nn.Module:
+    head_params = set()
+    if exclude_head and hasattr(model, "heads"):
+        for p in model.heads.parameters():
+            head_params.add(p)
+    if exclude_head and hasattr(model, "classifier"):
+        for p in model.classifier.parameters():
+            head_params.add(p)
+    for p in model.parameters():
+        if exclude_head and p in head_params:
+            p.requires_grad = True
+        else:
+            p.requires_grad = not freeze
+    return model
+
+
+def unfreeze_last_transformer_blocks(model: nn.Module, k: int = 1) -> nn.Module:
+    enc_parent, blocks = _find_transformer_blocks(model)
+    if blocks is None:
+        return model
+    total = len(blocks)
+    k = min(max(int(k), 0), total)
+    # freeze all first
+    for p in model.parameters():
+        p.requires_grad = False
+    # unfreeze last k blocks
+    for i in range(total - k, total):
+        for p in blocks[i].parameters():
+            p.requires_grad = True
+    # always ensure head params are trainable
+    if hasattr(model, "heads"):
+        for p in model.heads.parameters():
+            p.requires_grad = True
+    if hasattr(model, "classifier"):
+        for p in model.classifier.parameters():
+            p.requires_grad = True
+    return model
+
+
+# --------------------------
+# Wrapper that exposes embeddings
+# --------------------------
+class ViTWrapper(nn.Module):
+    """
+    Wrap torchvision vit model to:
+      - replace classifier head
+      - optionally freeze backbone
+      - expose embeddings via forward(x, return_embeds=True) or extract_embeddings(x)
+    """
+
+    def __init__(self, base_vit: nn.Module, num_classes: int = 5, head_dropout: float = 0.0, freeze_backbone_flag: bool = False, device: str = "cpu"):
+        super().__init__()
+        self.device = torch.device(device)
+        self.vit = base_vit.to(self.device)
+
+        # Replace head as requested
+        _replace_head_with_linear_module(
+            self.vit, num_classes, head_dropout=head_dropout)
+
+        # If user wants to freeze backbone, keep head trainable
+        if freeze_backbone_flag:
+            freeze_backbone(self.vit, freeze=True, exclude_head=True)
+
+    def forward(self, x: torch.Tensor, return_embeds: bool = False) -> torch.Tensor:
+        """
+        Standard forward: model(x) -> logits
+        If return_embeds=True -> return embeddings (B, D) where D is pooled feature dimension.
+        """
+        x = x.to(self.device)
+        if return_embeds:
+            return self.extract_embeddings(x)
+        # default: logits
+        return self.vit(x)
+
+    def extract_embeddings(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Try multiple strategies to obtain embeddings from the backbone:
+        1) If model has forward_features -> use it.
+        2) Otherwise register a forward hook on the last child module (just before heads) and run a forward pass to capture its output.
+        The returned embedding is pooled into a 1D vector per sample (mean over extra dims or first token if present).
+        """
+        # Strategy 1: common API
+        if hasattr(self.vit, "forward_features"):
+            with torch.no_grad():
+                # may be [B, C] or [B, seq, C] or [B, C, H, W]
+                feats = self.vit.forward_features(x)
+        else:
+            # Strategy 2: forward-hook fallback
+            # find last child module before 'heads' or 'classifier'
+            last_mod_name = None
+            last_mod = None
+            children = list(self.vit.named_children())
+            for name, mod in children:
+                if name in ("heads", "classifier"):
+                    break
+                last_mod_name = name
+                last_mod = mod
+            if last_mod is None:
+                # final fallback: run forward and use logits (not ideal)
+                with torch.no_grad():
+                    out = self.vit(x)
+                # use logits as proxy embedding (not recommended)
+                return out.detach()
+            # capture output via hook
+            saved = {}
+
+            def _hook(module, inp, outp):
+                saved['out'] = outp.detach()
+
+            handle = last_mod.register_forward_hook(_hook)
+            with torch.no_grad():
+                _ = self.vit(x)
+            handle.remove()
+            if 'out' not in saved:
+                # fallback - return logits
+                with torch.no_grad():
+                    out = self.vit(x)
+                return out.detach()
+            feats = saved['out']  # could be many shapes
+
+        # Now pool feats to vector: handle common shapes
+        # If feats shape is (B, C) -> done
+        if feats.ndim == 2:
+            return feats.detach().to(self.device)
+        # If (B, seq_len, C) -> assume cls token is first
+        if feats.ndim == 3:
+            # if seq dim > channel dim, try first token
+            # choose: use first token if seq_len > 1 else mean
+            if feats.shape[1] >= 1:
+                emb = feats[:, 0, :].detach()
+                return emb.to(self.device)
+            else:
+                emb = feats.mean(dim=1).detach()
+                return emb.to(self.device)
+        # If (B, C, H, W) -> global average pool
+        if feats.ndim == 4:
+            emb = feats.mean(dim=(-1, -2)).detach()  # (B, C)
+            return emb.to(self.device)
+        # Else flatten last dims
+        emb = feats.view(feats.shape[0], -1).detach()
+        return emb.to(self.device)
+
+
+# --------------------------
+# Embedding MLP head (for training on embeddings)
+# --------------------------
+class EmbeddingHead(nn.Module):
+    """
+    Small MLP to classify precomputed embeddings.
+    """
+
+    def __init__(self, in_dim: int, hidden: int = 512, num_classes: int = 5, dropout: float = 0.4):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, num_classes)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+def build_mlp_on_embeddings(input_dim: int, num_classes: int = 5, hidden: int = 512, dropout: float = 0.4, device: str = "cpu") -> nn.Module:
+    m = EmbeddingHead(input_dim, hidden=hidden,
+                      num_classes=num_classes, dropout=dropout)
+    return m.to(torch.device(device))
+
+
+# --------------------------
+# Public build_vit that mirrors your previous API
+# --------------------------
+def build_vit(num_classes: int = 5,
+              pretrained: bool = False,
+              device: str = "cpu",
+              head_dropout: float = 0.0,
+              freeze_backbone_flag: bool = False) -> nn.Module:
+    """
+    Build a torchvision ViT (vit_b_16) wrapped in ViTWrapper.
+    - returns a ViTWrapper instance with a replacable head.
+    - model(x) -> logits (same as before)
+    - model(x, return_embeds=True) -> embeddings (B, D)
+    - model.extract_embeddings(x) -> embeddings (B, D)
+    """
+    if vit_b_16 is None:
+        raise ImportError(
+            "torchvision ViT (vit_b_16) not available in this environment.")
+    # prefer official weights if requested
+    if pretrained:
+        weights = ViT_B_16_Weights.DEFAULT if ViT_B_16_Weights is not None else None
+        base = vit_b_16(weights=weights)
+    else:
+        base = vit_b_16(weights=None)
+    wrapper = ViTWrapper(base_vit=base, num_classes=num_classes, head_dropout=head_dropout,
+                         freeze_backbone_flag=freeze_backbone_flag, device=device)
+    return wrapper

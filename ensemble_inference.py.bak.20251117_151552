@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+# ensemble_inference.py
+"""
+Ensemble + TTA inference for SAND task1 (drop-in replacement).
+Usage example:
+python ensemble_inference.py \
+  --data_dir /Users/pranav/Desktop/Task1 \
+  --test_xlsx /Users/pranav/Desktop/Task1/test/sand_task1_test.xlsx \
+  --model_dirs ./outputs_vit_onecycle_focal ./outputs_vit_ft_unfreeze8 \
+  --cache_dir /Users/pranav/Desktop/Task1/cache_logmel_N256 \
+  --ttas 5 \
+  --device mps \
+  --out_csv ./ensemble/submission.csv
+"""
+import argparse
+from pathlib import Path
+import torch
+import numpy as np
+import pandas as pd
+import tqdm
+import logging
+from typing import List, Dict
+
+from dataset import SandSubjectDataset, find_wav_for_subject, random_augment
+from model import build_vit
+
+# -------------------------
+# Helper: robust state_dict adapter + loader
+# -------------------------
+
+
+def _common_dot_prefix(keys: List[str]) -> str:
+    """Return a common dot-terminated prefix among keys if any (e.g. 'vit.' or 'module.')."""
+    if not keys:
+        return ""
+    pref = keys[0]
+    for k in keys[1:]:
+        # shrink pref until it's prefix of k
+        while not k.startswith(pref) and pref:
+            if '.' in pref:
+                pref = pref.rsplit('.', 1)[0]
+            else:
+                pref = ''
+        if pref == '':
+            break
+    if pref and not pref.endswith('.'):
+        pref = pref + '.'
+    return pref
+
+
+def _adapt_state_dict_keys(state_dict: Dict[str, torch.Tensor], target_keys: List[str]):
+    """
+    Try simple adaptations:
+      - strip a common dot-terminated prefix if present in state_dict keys
+      - remove/add 'vit.' prefix heuristically
+    Returns adapted_state_dict, note_str
+    """
+    s_keys = list(state_dict.keys())
+    note_parts = []
+
+    # 1) try stripping longest common dot prefix
+    common_pref = _common_dot_prefix(s_keys)
+    if common_pref:
+        stripped = {k[len(common_pref):] if k.startswith(
+            common_pref) else k: v for k, v in state_dict.items()}
+        overlap = len(set(stripped.keys()).intersection(set(target_keys)))
+        if overlap > max(1, len(target_keys) // 10):
+            note_parts.append(
+                f"stripped common prefix '{common_pref}' ({overlap} keys overlap)")
+            return stripped, ";".join(note_parts)
+
+    # 2) if state_dict keys start with 'vit.' but target_keys do not, remove vit.
+    if any(k.startswith("vit.") for k in s_keys) and not any(k.startswith("vit.") for k in target_keys):
+        new = {k[len("vit."):]: v for k, v in state_dict.items()
+               if k.startswith("vit.")}
+        note_parts.append("removed leading 'vit.'")
+        return new, ";".join(note_parts)
+
+    # 3) if state_dict keys do not have 'vit.' but target_keys do, add vit.
+    if not any(k.startswith("vit.") for k in s_keys) and any(k.startswith("vit.") for k in target_keys):
+        new = {("vit." + k): v for k, v in state_dict.items()}
+        note_parts.append("added leading 'vit.'")
+        return new, ";".join(note_parts)
+
+    # fallback: return original
+    return state_dict, ";".join(note_parts)
+
+
+def load_models(model_dirs: List[str], device: torch.device):
+    """
+    Robust loader:
+      - finds a checkpoint file (best_model.pt or any .pt) in each provided directory
+      - extracts state dict from wrapper keys like 'model_state' or 'state_dict' when present
+      - attempts key adaptation and loads with strict=False
+      - logs missing/unexpected keys for diagnostics
+    Returns: list of models (in eval mode)
+    """
+    models = []
+    for d in model_dirs:
+        p = Path(d)
+        if not p.exists():
+            raise FileNotFoundError(f"Model directory not found: {p}")
+        # find checkpoint
+        ck = p / "best_model.pt"
+        if not ck.exists():
+            # fallback: first .pt in folder
+            cands = sorted(list(p.glob("*.pt")))
+            if len(cands) == 0:
+                raise FileNotFoundError(f"No checkpoint (.pt) found in {p}")
+            ck = cands[0]
+
+        logging.info(f"Loading checkpoint {ck}")
+        # instantiate architecture
+        m = build_vit(num_classes=5, pretrained=False, device=str(device))
+        # load checkpoint file
+        state = torch.load(str(ck), map_location="cpu")
+        if isinstance(state, dict) and 'model_state' in state:
+            st = state['model_state']
+        elif isinstance(state, dict) and 'state_dict' in state:
+            st = state['state_dict']
+        else:
+            st = state
+
+        # ensure dict
+        if not isinstance(st, dict):
+            raise RuntimeError(f"Checkpoint format not understood for {ck}")
+
+        target_keys = list(m.state_dict().keys())
+        adapted_st, note = _adapt_state_dict_keys(st, target_keys)
+        if note:
+            logging.info(f"[{p.name}] adaptation note: {note}")
+
+        # count overlap before load
+        common = set(adapted_st.keys()).intersection(set(target_keys))
+        logging.info(
+            f"[{p.name}] matching keys: {len(common)}/{len(target_keys)}")
+
+        # try non-strict load first
+        try:
+            load_res = m.load_state_dict(adapted_st, strict=False)
+            missing = getattr(load_res, "missing_keys", None)
+            unexpected = getattr(load_res, "unexpected_keys", None)
+            logging.info(
+                f"[{p.name}] load_state_dict(strict=False) missing: {len(missing) if missing is not None else 'N/A'}, unexpected: {len(unexpected) if unexpected is not None else 'N/A'}")
+            if missing:
+                logging.debug(
+                    f"[{p.name}] sample missing keys: {missing[:10]}")
+            if unexpected:
+                logging.debug(
+                    f"[{p.name}] sample unexpected keys: {unexpected[:10]}")
+        except Exception as e:
+            logging.warning(
+                f"[{p.name}] load_state_dict(strict=False) failed: {e}. Trying to load exact intersection keys.")
+            # try loading only intersection keys
+            filtered = {k: v for k, v in adapted_st.items()
+                        if k in target_keys}
+            try:
+                load_res = m.load_state_dict(filtered, strict=False)
+                logging.info(
+                    f"[{p.name}] loaded filtered subset, reported missing/unexpected.")
+            except Exception as e2:
+                logging.error(
+                    f"[{p.name}] failed to load even filtered keys: {e2}")
+                raise e2
+
+        m.to(device)
+        m.eval()
+        models.append(m)
+    return models
+
+# -------------------------
+# TTA helper
+# -------------------------
+
+
+def make_tta_stack(wav_path: Path, ds_inst: SandSubjectDataset, tta: int):
+    """
+    Returns a tensor of shape (TTA, C, H, W) on CPU.
+    Uses dataset methods to compute mel+deltas and convert to tensor.
+    TTA[0] is clean (no augment); others are mild random_augment variants.
+    """
+    wav, sr = ds_inst._load_wav(wav_path)
+    stacks = []
+    # clean
+    stack_clean = ds_inst._wave_to_mel_and_deltas(wav, sr)
+    stacks.append(ds_inst._stack_to_tensor(stack_clean).unsqueeze(0))
+    # TTA augmentations (mild)
+    for _ in range(tta - 1):
+        try:
+            wav_aug = random_augment(wav.copy(), sr, strong=False)
+        except Exception:
+            wav_aug = wav
+        stack = ds_inst._wave_to_mel_and_deltas(wav_aug, sr)
+        stacks.append(ds_inst._stack_to_tensor(stack).unsqueeze(0))
+    return torch.cat(stacks, dim=0)  # shape (TTA, C, H, W)
+
+# -------------------------
+# Main
+# -------------------------
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument('--data_dir', type=str, required=True)
+    p.add_argument('--test_xlsx', type=str, required=True)
+    p.add_argument('--model_dirs', nargs='+', required=True,
+                   help='Paths with best_model.pt inside')
+    p.add_argument('--cache_dir', type=str, default=None)
+    p.add_argument('--ttas', type=int, default=5)
+    p.add_argument('--batch_size', type=int, default=8)
+    p.add_argument('--device', type=str, default='cpu')
+    p.add_argument('--out_csv', type=str, default='./submission.csv')
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s %(levelname)s: %(message)s')
+    device = torch.device(args.device)
+    data_dir = Path(args.data_dir)
+    test_xlsx = Path(args.test_xlsx)
+    if not test_xlsx.exists():
+        raise FileNotFoundError(f"Test xlsx not found: {test_xlsx}")
+    df_test = pd.read_excel(str(test_xlsx))
+    if 'ID' not in df_test.columns:
+        raise ValueError("Test xlsx must contain column 'ID'")
+    ids = df_test['ID'].astype(str).tolist()
+
+    test_root = data_dir / 'test'
+    sheet_name = pd.ExcelFile(str(test_xlsx)).sheet_names[0]
+    ds_inst = SandSubjectDataset(root_dir=str(test_root), xlsx_path=str(test_xlsx),
+                                 sheet_name=sheet_name, cache_dir=args.cache_dir, train_mode=False)
+
+    # load models robustly
+    models = load_models(args.model_dirs, device)
+    logging.info(f"Loaded {len(models)} models for ensemble")
+
+    preds = []
+    for sid in tqdm.tqdm(ids, desc="Inferring"):
+        wav_path = find_wav_for_subject(test_root, sid)
+        if wav_path is None:
+            cand = test_root / f"{sid}.wav"
+            wav_path = cand if cand.exists() else None
+        if wav_path is None:
+            logging.warning(f"Missing WAV for {sid}, skipping.")
+            preds.append((sid, -1))
+            continue
+
+        # build TTA stacks (on CPU) and move to device in batch
+        stack_batch = make_tta_stack(
+            wav_path, ds_inst, args.ttas)  # (TTA, C, H, W)
+        stack_batch = stack_batch.to(device)
+
+        # accumulate averaged logits across models
+        logits_sum = None
+        for m in models:
+            with torch.no_grad():
+                out = m(stack_batch)  # (TTA, num_classes)
+                out_mean = out.mean(dim=0).cpu().numpy()  # (num_classes,)
+                if logits_sum is None:
+                    logits_sum = out_mean
+                else:
+                    logits_sum += out_mean
+        logits_avg = logits_sum / len(models)
+        pred_class = int(np.argmax(logits_avg) + 1)
+        preds.append((sid, pred_class))
+
+    # write CSV
+    out_csv = Path(args.out_csv)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    df_out = pd.DataFrame(preds, columns=['ID', 'Class'])
+    df_out.to_csv(str(out_csv), index=False)
+    logging.info("Wrote: %s", out_csv)
+    print(df_out['Class'].value_counts())
+
+
+if __name__ == '__main__':
+    main()
