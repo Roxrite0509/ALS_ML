@@ -1,0 +1,9 @@
+Traceback (most recent call last):
+  File "/Users/pranav/Desktop/Task1/sand_vit_baseline/ensemble_inference.py", line 148, in <module>
+    main()
+    ~~~~^^
+  File "/Users/pranav/Desktop/Task1/sand_vit_baseline/ensemble_inference.py", line 103, in main
+    models = load_models(args.model_dirs, device)
+  File "/Users/pranav/Desktop/Task1/sand_vit_baseline/ensemble_inference.py", line 45, in load_models
+    raise FileNotFoundError(f"No best_model.pt in {p}")
+FileNotFoundError: No best_model.pt in /Users/pranav/Desktop/Task1/sand_vit_baseline/runs_balanced_aug/seed_44
